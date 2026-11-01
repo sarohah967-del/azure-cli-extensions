@@ -1,9 +1,19 @@
 # az provisionedmachine ssh-cert-create
 Create a short-lived SSH certificate for authenticating to a provisioned machine.
 
-Generates an SSH certificate signed by the device's CA key stored in Azure Key Vault. The certificate includes the caller's identity and role, and is valid for the duration of the active access window.
+Requests a role-specific SSH authorization from HCI RP (a JSON Web Signature signed with the HCI RP SSH CA key), embeds it in an OpenSSH certificate and countersigns that certificate with the device's CA key stored in the customer Azure Key Vault. The certificate includes the caller's identity and role, and is valid for the active access window (at most 8 hours).
 
-Requires an active eligible role on the target device resource. The caller's identity and role are resolved automatically.
+Requires an active eligible Provisioned Machine Admin or Contributor role on the target device resource. The caller's identity and role are resolved automatically.
+
+## Flow
+
+1. Verify the caller's active PIM activation and resolve the role (`provisionedmachineadmin` or `provisionedmachinecontributor`). Reader cannot SSH.
+2. Generate an ephemeral RSA-4096 key pair.
+3. `POST {resourceId}/issueSshCertificateForAdmin` or `.../issueSshCertificateForContributor` (`api-version=2026-03-15-preview`) with `username`, `userPublicKey`, `durationInHours`, `validFrom` and `validTo`. The window is clamped to the RP limit of 8 hours (minus a 5-minute clock-skew margin). HCI RP returns `username`, `role`, `validFrom`, `validTo` and `userSSHJSONWebSignature` (compact JWS strings).
+4. Build an OpenSSH user certificate with the RP-authorized username, role and validity. The JWS strings are stored comma-separated in the non-critical `hci-rp-jws@microsoft.com` extension. The certificate is signed (countersigned) with the `{deviceId}-ssh-ca` key in the customer Key Vault.
+5. The device verifies the Key Vault (customer device CA) signature, then the HCI RP JWS in the extension against the HCI RP CA trust anchor.
+
+HCI RP returns HTTP 501 while issuance is disabled; the command reports this as an error.
 
 ## Parameters
 

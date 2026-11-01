@@ -1206,6 +1206,184 @@ class TestSignCertificateMetadata(unittest.TestCase):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+_TEST_JWS = "eyJhbGciOiJFUzI1NiJ9.eyJ1c2VybmFtZSI6InVzZXIifQ.c2lnbmF0dXJl"
+
+
+def _rp_response(status=200, body=None):
+    resp = mock.Mock(status_code=status, text=json.dumps(body or {}))
+    resp.json.return_value = body if body is not None else {}
+    return resp
+
+
+class TestComputeRpValidityWindow(unittest.TestCase):
+    """Tests for compute_rp_validity_window()."""
+
+    _NOW = pm.datetime.datetime(2026, 11, 2, 10, 0, 0, tzinfo=pm.datetime.timezone.utc)
+
+    def test_short_pim_window_is_kept(self):
+        start, end, hours = pm.compute_rp_validity_window("2026-11-02T12:30:00Z", now=self._NOW)
+        self.assertEqual((start, end, hours), ("2026-11-02T10:00:00Z", "2026-11-02T12:30:00Z", 3))
+
+    def test_long_pim_window_is_clamped_below_eight_hours(self):
+        _, end, hours = pm.compute_rp_validity_window("2026-11-03T10:00:00Z", now=self._NOW)
+        self.assertEqual(end, "2026-11-02T17:55:00Z")
+        self.assertEqual(hours, 8)
+
+    def test_sub_hour_window_requests_minimum_duration(self):
+        _, end, hours = pm.compute_rp_validity_window("2026-11-02T10:10:00Z", now=self._NOW)
+        self.assertEqual(end, "2026-11-02T10:10:00Z")
+        self.assertEqual(hours, 1)
+
+    def test_expired_window_raises(self):
+        with self.assertRaises(azclierror.AuthenticationError):
+            pm.compute_rp_validity_window("2026-11-02T09:59:00Z", now=self._NOW)
+
+
+class TestRequestHciRpAuthorization(unittest.TestCase):
+    """Tests for request_hci_rp_authorization()."""
+
+    _RID = ("/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg"
+            "/providers/Microsoft.AzureStackHCI/edgeMachines/em1")
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix="azssh_rp_test_")
+        self.pub_path = os.path.join(self.tmp_dir, "id_rsa.pem.pub")
+        with open(self.pub_path, "w") as f:
+            f.write("ssh-rsa AAAAPUBLIC user@host\n")
+        profile_patch = mock.patch('azure.cli.core._profile.Profile')
+        mock_profile = profile_patch.start()
+        creds = mock.Mock()
+        creds.get_token.return_value = mock.Mock(token="tok")
+        mock_profile.return_value.get_login_credentials.return_value = (creds, None, None)
+        self.addCleanup(profile_patch.stop)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _call(self, role="provisionedmachineadmin"):
+        return pm.request_hci_rp_authorization(
+            mock.Mock(), self._RID, role, "user", self.pub_path, "2099-01-01T00:00:00Z")
+
+    def _ok_body(self, **overrides):
+        body = {"username": "user", "role": "provisionedmachineadmin",
+                "validFrom": "2026-11-02T10:00:00.1234567+00:00",
+                "validTo": "2026-11-02T17:55:00+00:00",
+                "userSSHJSONWebSignature": [_TEST_JWS]}
+        body.update(overrides)
+        return body
+
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.requests.post')
+    def test_admin_role_calls_admin_action(self, mock_post):
+        mock_post.return_value = _rp_response(body=self._ok_body())
+
+        result = self._call()
+
+        url = mock_post.call_args[0][0]
+        self.assertTrue(url.endswith("/edgeMachines/em1/issueSshCertificateForAdmin"
+                                     "?api-version=2026-03-15-preview"))
+        sent = mock_post.call_args[1]["json"]
+        self.assertEqual(sent["username"], "user")
+        self.assertEqual(sent["userPublicKey"], "ssh-rsa AAAAPUBLIC user@host")
+        self.assertEqual(sent["durationInHours"], 8)
+        self.assertEqual(result["jws"], [_TEST_JWS])
+        self.assertEqual(result["validFrom"], "2026-11-02T10:00:00Z")
+        self.assertEqual(result["validTo"], "2026-11-02T17:55:00Z")
+
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.requests.post')
+    def test_contributor_role_calls_contributor_action(self, mock_post):
+        mock_post.return_value = _rp_response(
+            body=self._ok_body(role="provisionedmachinecontributor"))
+
+        self._call(role="provisionedmachinecontributor")
+
+        self.assertIn("/issueSshCertificateForContributor?", mock_post.call_args[0][0])
+
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.requests.post')
+    def test_reader_role_is_rejected_without_calling_rp(self, mock_post):
+        with self.assertRaises(azclierror.ForbiddenError):
+            self._call(role="provisionedmachinereader")
+        mock_post.assert_not_called()
+
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.requests.post')
+    def test_http_errors_are_mapped(self, mock_post):
+        cases = {400: azclierror.InvalidArgumentValueError,
+                 403: azclierror.ForbiddenError,
+                 404: azclierror.ResourceNotFoundError,
+                 501: azclierror.AzureResponseError,
+                 500: azclierror.AzureResponseError}
+        for status, error in cases.items():
+            with self.subTest(status=status):
+                mock_post.return_value = _rp_response(
+                    status, {"error": {"message": "bad"}})
+                with self.assertRaises(error):
+                    self._call()
+
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.requests.post')
+    def test_invalid_responses_are_rejected(self, mock_post):
+        bad_bodies = [
+            self._ok_body(userSSHJSONWebSignature=[]),
+            self._ok_body(userSSHJSONWebSignature=["not-a-jws"]),
+            self._ok_body(role="provisionedmachinecontributor"),
+            self._ok_body(username="someone-else"),
+            self._ok_body(validTo="2026-11-02T09:00:00Z"),
+        ]
+        for body in bad_bodies:
+            with self.subTest(body=body):
+                mock_post.return_value = _rp_response(body=body)
+                with self.assertRaises(azclierror.AzureResponseError):
+                    self._call()
+
+
+class TestSignCertificateWithHciRpJws(unittest.TestCase):
+    """Countersigned certificate carries the HCI RP JWS and parses with OpenSSH."""
+
+    def test_certificate_embeds_jws_and_verifies(self):
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding, rsa, utils
+
+        ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        user_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        ca_numbers = ca_key.public_key().public_numbers()
+
+        tmp_dir = tempfile.mkdtemp(prefix="azssh_jws_test_")
+        self.addCleanup(shutil.rmtree, tmp_dir, True)
+        pub_path = os.path.join(tmp_dir, "id_rsa.pem.pub")
+        with open(pub_path, "wb") as f:
+            f.write(user_key.public_key().public_bytes(
+                serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH))
+
+        def kv_sign(_cmd, _vault, _key, digest):
+            return ca_key.sign(digest, padding.PKCS1v15(), utils.Prehashed(hashes.SHA512()))
+
+        metadata = {
+            "username": "user", "role": "provisionedmachineadmin", "deviceId": "em1",
+            "startTime": "2026-11-02T10:00:00Z", "endTime": "2026-11-02T17:55:00Z",
+            "publicKeyPath": pub_path, "hciRpAuthorization": [_TEST_JWS, _TEST_JWS],
+        }
+        with mock.patch.object(pm, '_get_ca_public_key', return_value=(ca_numbers.e, ca_numbers.n)), \
+                mock.patch.object(pm, '_kv_sign_digest', side_effect=kv_sign):
+            cert_path = pm.sign_certificate_metadata(mock.Mock(), "vault", metadata)["certificatePath"]
+
+        with open(cert_path, "r") as f:
+            blob = base64.b64decode(f.read().split()[1])
+        self.assertIn(b"hci-rp-jws@microsoft.com", blob)
+        self.assertIn(f"{_TEST_JWS},{_TEST_JWS}".encode(), blob)
+
+        # Trailer = string(string("rsa-sha2-512") + string(sig)); 256-byte sig for RSA-2048.
+        trailer_len = 4 + (4 + len(b"rsa-sha2-512")) + (4 + 256)
+        body, signature = blob[:-trailer_len], blob[-256:]
+        ca_key.public_key().verify(signature, body, padding.PKCS1v15(), hashes.SHA512())
+
+        keygen = shutil.which("ssh-keygen")
+        if keygen:
+            out = subprocess.run([keygen, "-L", "-f", cert_path],
+                                 capture_output=True, text=True, check=True).stdout
+            self.assertIn("hci-rp-jws@microsoft.com", out)
+            self.assertIn("permit-pty", out)
+            self.assertIn("username=user", out)
+            self.assertIn("role=provisionedmachineadmin", out)
+
+
 class TestResolveLatestOsImageVersion(unittest.TestCase):
     """Tests for the shared resolve_latest_os_image_version helper."""
 
