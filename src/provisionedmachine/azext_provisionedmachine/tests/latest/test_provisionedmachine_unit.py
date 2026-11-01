@@ -18,6 +18,7 @@ Run with: python -m pytest azext_provisionedmachine/tests/latest/test_provisione
 """
 
 import unittest
+from unittest import mock
 import sys
 import os
 
@@ -72,6 +73,8 @@ azclierror_mod = sys.modules['azure.cli.core.azclierror']
 azclierror_mod.ResourceNotFoundError = type('ResourceNotFoundError', (Exception,), {})
 azclierror_mod.InvalidArgumentValueError = type('InvalidArgumentValueError', (Exception,), {})
 azclierror_mod.RequiredArgumentMissingError = type('RequiredArgumentMissingError', (Exception,), {})
+azclierror_mod.FileOperationError = type('FileOperationError', (Exception,), {})
+azclierror_mod.MutuallyExclusiveArgumentError = type('MutuallyExclusiveArgumentError', (Exception,), {})
 
 # Add required attributes to stubs
 aaz_mod = sys.modules['azure.cli.core.aaz']
@@ -114,6 +117,8 @@ from azext_provisionedmachine.commands import (
 
 # Import _compare_versions from install_os module
 from azext_provisionedmachine.aaz.latest.provisionedmachine._install_os import InstallOs
+from azext_provisionedmachine.aaz.latest.provisionedmachine._create import Create
+from azext_provisionedmachine.aaz.latest.provisionedmachine._reset_os import ResetOs
 _compare_versions = InstallOs._compare_versions
 
 
@@ -423,22 +428,42 @@ class TestOsImageListTableTransformer(unittest.TestCase):
         self.assertEqual(rows[1]["VsrVersion"], "50.2605.0.3")
         self.assertEqual(rows[2]["VsrVersion"], "50.2603.0.1")
 
-    def test_os_image_type_sourced_from_injected_field(self):
-        """OsImageType should come from the injected _os_image_type field."""
-        # Simulate the _output() method injecting _os_image_type
+    def test_os_image_type_sourced_from_response_solution_type(self):
+        """OsImageType should come from the response properties.solutionType field."""
         test_data = [
             {
-                "properties": {"validatedSolutionRecipeVersion": "50.2607.0.8"},
-                "_os_image_type": "AzureLinux"
+                "properties": {
+                    "validatedSolutionRecipeVersion": "50.2607.0.8",
+                    "solutionType": "AzureLinux",
+                }
             },
             {
-                "properties": {"validatedSolutionRecipeVersion": "50.2605.0.3"},
-                "_os_image_type": "AzureLinux"
+                "properties": {
+                    "validatedSolutionRecipeVersion": "50.2605.0.3",
+                    "solutionType": "HCI",
+                }
             }
         ]
         rows = transform_os_image_list_table_output(test_data)
         self.assertEqual(rows[0]["OsImageType"], "AzureLinux")
-        self.assertEqual(rows[1]["OsImageType"], "AzureLinux")
+        self.assertEqual(rows[1]["OsImageType"], "HCI")
+
+    def test_architecture_column_extracted_from_properties(self):
+        """Architecture comes from properties.architecture; a missing value defaults to empty."""
+        test_data = [
+            {
+                "properties": {
+                    "validatedSolutionRecipeVersion": "50.2607.0.8",
+                    "architecture": "arm64",
+                },
+            },
+            {
+                "properties": {"validatedSolutionRecipeVersion": "50.2605.0.3"},
+            },
+        ]
+        rows = transform_os_image_list_table_output(test_data)
+        self.assertEqual(rows[0]["Architecture"], "arm64")
+        self.assertEqual(rows[1]["Architecture"], "")
 
     def test_non_list_input_returns_as_is(self):
         """Non-list input passes through unchanged."""
@@ -598,6 +623,425 @@ class TestAutoResolveVersionLogic(unittest.TestCase):
             if vsr and (latest_version is None or _compare_versions(vsr, latest_version) > 0):
                 latest_version = vsr
         self.assertEqual(latest_version, "50.2605.0.3")
+
+
+class TestInstallOsImageSelection(unittest.TestCase):
+    """Standalone install must use the existing device's hardware architecture."""
+
+    @staticmethod
+    def _arg(value):
+        argument = mock.Mock()
+        argument.to_serialized_data.return_value = value
+        return argument
+
+    def setUp(self):
+        self.command = mock.Mock()
+        self.command.ctx.args = types.SimpleNamespace(
+            os_image_type=self._arg("AzureLinux"),
+            os_image_version=None,
+            ssh_public_key=self._arg("ssh-rsa test-key"),
+            key_vault_secret_id=None,
+            resource_group=self._arg("test-rg"),
+            edge_machine_name=self._arg("test-machine"),
+        )
+        for name in ("ip_address", "subnet_mask", "gateway", "dns_servers", "vlan_id",
+                     "ntp_server", "hostname"):
+            setattr(self.command.ctx.args, name, None)
+        self.machine = {
+            "location": "eastus",
+            "properties": {
+                "machineState": "Unpurposed",
+                "reportedProperties": {"hardwareProfile": {"architecture": "amd64"}},
+            },
+        }
+        self.command._validate_machine_state.return_value = self.machine
+        self.command._resolve_latest_version.return_value = "50.2610.0.88"
+
+    def test_auto_selection_uses_reported_hardware_architecture(self):
+        for architecture in ("amd64", "arm64", "ARM64"):
+            with self.subTest(architecture=architecture):
+                self.command.ctx.args.os_image_version = None
+                self.machine["properties"]["reportedProperties"]["hardwareProfile"]["architecture"] = architecture
+
+                InstallOs.pre_operations(self.command)
+
+                self.command._resolve_latest_version.assert_called_with("AzureLinux", "eastus", architecture)
+                self.assertEqual(self.command.ctx.args.os_image_version, "50.2610.0.88")
+
+    def test_missing_hardware_architecture_defaults_to_amd64(self):
+        for properties in (
+                {"reportedProperties": {"hardwareProfile": {"architecture": None}}},
+                {"reportedProperties": {"hardwareProfile": {"architecture": ""}}},
+                {"reportedProperties": {"hardwareProfile": {}}},
+                {"reportedProperties": {"hardwareProfile": None}},
+                {"reportedProperties": {}},
+                {"reportedProperties": None},
+                {}):
+            with self.subTest(properties=properties):
+                self.command.ctx.args.os_image_version = None
+                self.machine["properties"] = properties
+
+                InstallOs.pre_operations(self.command)
+
+                self.command._resolve_latest_version.assert_called_with("AzureLinux", "eastus", "amd64")
+
+    def test_explicit_version_bypasses_automatic_selection(self):
+        self.machine["properties"]["reportedProperties"] = None
+        for os_type in ("AzureLinux", "HCI"):
+            with self.subTest(os_type=os_type):
+                version = self._arg("50.2609.0.10")
+                self.command.ctx.args.os_image_type = self._arg(os_type)
+                self.command.ctx.args.os_image_version = version
+                self.command.ctx.args.key_vault_secret_id = self._arg("/test-secret")
+
+                InstallOs.pre_operations(self.command)
+
+                self.command._resolve_latest_version.assert_not_called()
+                self.assertIs(self.command.ctx.args.os_image_version, version)
+
+    def test_empty_explicit_version_uses_hardware_architecture(self):
+        self.command.ctx.args.os_image_version = self._arg("")
+
+        InstallOs.pre_operations(self.command)
+
+        self.command._resolve_latest_version.assert_called_once_with("AzureLinux", "eastus", "amd64")
+
+    def test_nonempty_architecture_is_forwarded_without_new_cli_validation(self):
+        self.machine["properties"]["reportedProperties"]["hardwareProfile"]["architecture"] = "riscv64"
+
+        InstallOs.pre_operations(self.command)
+
+        self.command._resolve_latest_version.assert_called_once_with("AzureLinux", "eastus", "riscv64")
+
+    def test_missing_required_credentials_stops_before_image_lookup(self):
+        for os_type in ("AzureLinux", "HCI"):
+            with self.subTest(os_type=os_type):
+                self.command.ctx.args.os_image_type = self._arg(os_type)
+                self.command.ctx.args.ssh_public_key = None
+                self.command.ctx.args.key_vault_secret_id = None
+
+                with self.assertRaises(azclierror_mod.RequiredArgumentMissingError):
+                    InstallOs.pre_operations(self.command)
+
+                self.command._resolve_latest_version.assert_not_called()
+
+    def test_hci_automatic_selection_does_not_use_hardware_architecture(self):
+        self.command.ctx.args.os_image_type = self._arg("HCI")
+        self.command.ctx.args.key_vault_secret_id = self._arg("/test-secret")
+
+        InstallOs.pre_operations(self.command)
+
+        self.command._resolve_latest_version.assert_called_once_with("HCI", "eastus", None)
+
+    def test_resolver_forwards_architecture_to_existing_helper(self):
+        with mock.patch(
+                "azext_provisionedmachine.provisioned_machine_utils.resolve_latest_os_image_version",
+                return_value="60.2611.0.40") as resolve_version:
+            result = InstallOs._resolve_latest_version(self.command, "AzureLinux", "eastus", "arm64")
+
+        resolve_version.assert_called_once_with(
+            self.command.ctx.cli_ctx, self.command.ctx.subscription_id, "AzureLinux", "eastus", "arm64")
+        self.assertEqual(result, "60.2611.0.40")
+
+    def test_machine_get_uses_architecture_capable_api_and_preserves_state_checks(self):
+        with mock.patch("azure.cli.core.util.send_raw_request", create=True) as send_request:
+            send_request.return_value.status_code = 200
+            send_request.return_value.json.return_value = self.machine
+            for state in ("Unpurposed", "Transitioning"):
+                with self.subTest(state=state):
+                    self.machine["properties"]["machineState"] = state
+
+                    self.assertIs(InstallOs._validate_machine_state(self.command), self.machine)
+                    self.assertIn("api-version=2026-10-15-preview", send_request.call_args[0][2])
+
+            for state in ("Registering", "Purposed", "Failed"):
+                with self.subTest(state=state):
+                    self.machine["properties"]["machineState"] = state
+
+                    with self.assertRaises(azclierror_mod.InvalidArgumentValueError):
+                        InstallOs._validate_machine_state(self.command)
+
+    def test_image_lookup_failure_prevents_job_submission(self):
+        self.command.pre_operations.side_effect = lambda: InstallOs.pre_operations(self.command)
+        self.command._resolve_latest_version.side_effect = azclierror_mod.ResourceNotFoundError("No matching image")
+
+        with self.assertRaisesRegex(azclierror_mod.ResourceNotFoundError, "No matching image"):
+            list(InstallOs._execute_operations(self.command))
+
+        self.command.EdgeMachinesJobsProvisionOs.assert_not_called()
+
+    def test_machine_read_errors_do_not_fall_back_to_image_selection(self):
+        self.command.pre_operations.side_effect = lambda: InstallOs.pre_operations(self.command)
+        self.command._validate_machine_state.side_effect = lambda: InstallOs._validate_machine_state(self.command)
+        with mock.patch("azure.cli.core.util.send_raw_request", create=True) as send_request:
+            for status in (403, 404, 500):
+                with self.subTest(status=status):
+                    send_request.return_value.status_code = status
+
+                    with self.assertRaises(azclierror_mod.InvalidArgumentValueError):
+                        list(InstallOs._execute_operations(self.command))
+
+                    self.command._resolve_latest_version.assert_not_called()
+                    self.command.EdgeMachinesJobsProvisionOs.assert_not_called()
+
+
+class TestResetOsImageSelection(unittest.TestCase):
+    """Reset must leave the ROE image choice to the resource provider."""
+
+    def test_reset_payload_requests_reset_without_overriding_image(self):
+        payload = ResetOs.EdgeMachinesJobsProvisionOs.content.fget(mock.Mock())
+        properties = payload["properties"]
+        request = properties["provisioningRequest"]
+        profile = request["osProfile"]
+
+        self.assertEqual(properties["jobType"], "ProvisionOs")
+        self.assertEqual(properties["deploymentMode"], "Deploy")
+        self.assertEqual(request["target"], "AzureLinux")
+        self.assertEqual(profile["osType"], "AzureLinuxROE")
+        self.assertNotIn("osImageLocation", profile)
+        self.assertNotIn("vsrVersion", profile)
+
+    def test_reset_state_checks_and_preflight_api_are_unchanged(self):
+        command = mock.Mock()
+        for name, value in (("resource_group", "test-rg"), ("edge_machine_name", "test-machine")):
+            argument = mock.Mock()
+            argument.to_serialized_data.return_value = value
+            setattr(command.ctx.args, name, argument)
+        with mock.patch("azure.cli.core.util.send_raw_request", create=True) as send_request:
+            send_request.return_value.status_code = 200
+            for state in ("Purposed", "Transitioning", "Resetting"):
+                with self.subTest(state=state):
+                    send_request.return_value.json.return_value = {"properties": {"machineState": state}}
+
+                    ResetOs._validate_machine_state(command)
+
+                    self.assertIn("api-version=2026-05-01-preview", send_request.call_args[0][2])
+            for state in ("Registering", "Unpurposed", "Failed"):
+                with self.subTest(state=state):
+                    send_request.return_value.json.return_value = {"properties": {"machineState": state}}
+
+                    with self.assertRaises(azclierror_mod.InvalidArgumentValueError):
+                        ResetOs._validate_machine_state(command)
+
+
+class TestCreateImageSelection(unittest.TestCase):
+    """Create must validate the voucher before resolving a compatible image."""
+
+    @staticmethod
+    def _arg(value):
+        argument = mock.Mock()
+        argument.to_serialized_data.return_value = value
+        return argument
+
+    def setUp(self):
+        Create._validation_result = None
+        Create._resolved_version = None
+        self.addCleanup(setattr, Create, "_validation_result", None)
+        self.addCleanup(setattr, Create, "_resolved_version", None)
+        self.command = mock.Mock()
+        self.command.ctx.args = types.SimpleNamespace(
+            os_image_type=self._arg("AzureLinux"),
+            os_image_version=None,
+            location=self._arg("eastus"),
+        )
+        self.command._validate_voucher_response.side_effect = (
+            lambda: Create._validate_voucher_response(self.command)
+        )
+        self.validation_response = {
+            "ownershipVoucherValidationDetails": [{"validationStatus": "Valid", "architecture": "amd64"}]
+        }
+        self.events = []
+
+        def validate_voucher():
+            self.events.append("voucher")
+            Create._validation_result = self.validation_response
+
+        def resolve_image(*args):
+            self.events.append("image")
+            return "50.2610.0.20"
+
+        self.command.ValidateOwnershipVoucher.return_value.side_effect = validate_voucher
+        self.command._resolve_latest_version.side_effect = resolve_image
+        self.command.EdgeMachinesCreateOrUpdate.return_value.side_effect = lambda: self.events.append("create")
+
+    def test_auto_selection_uses_validated_voucher_architecture_before_create(self):
+        for architecture in ("amd64", "arm64", "AMD64"):
+            with self.subTest(architecture=architecture):
+                self.events.clear()
+                self.validation_response["ownershipVoucherValidationDetails"][0]["architecture"] = architecture
+
+                list(Create._execute_operations(self.command))
+
+                self.assertEqual(self.events, ["voucher", "image", "create"])
+                self.command._resolve_latest_version.assert_called_with(
+                    "azurelinux", "eastus", architecture.lower())
+                self.assertEqual(Create._resolved_version, "50.2610.0.20")
+
+    def test_explicit_version_is_preserved_without_image_lookup(self):
+        self.command.ctx.args.os_image_version = self._arg("50.2609.0.10")
+        self.validation_response["ownershipVoucherValidationDetails"][0].pop("architecture")
+
+        list(Create._execute_operations(self.command))
+
+        self.assertEqual(self.events, ["voucher", "create"])
+        self.command._resolve_latest_version.assert_not_called()
+        self.assertEqual(Create._resolved_version, "50.2609.0.10")
+
+    def test_local_validation_does_not_resolve_image_before_voucher_validation(self):
+        args = self.command.ctx.args
+        args.ownership_voucher = self._arg("voucher.pem")
+        args.ssh_public_key = self._arg("ssh-rsa test-key")
+        for name in ("site_resource_id", "arc_gateway_resource_id", "key_vault_secret_id",
+                     "ip_address", "subnet_mask", "gateway", "dns_servers", "vlan_id",
+                     "ntp_server", "timezone", "hostname", "proxy_settings"):
+            setattr(args, name, None)
+
+        with mock.patch("os.path.exists", return_value=True), \
+                mock.patch("os.path.isfile", return_value=True), \
+                mock.patch("builtins.open", mock.mock_open(read_data=b"voucher")):
+            Create.pre_operations(self.command)
+
+        self.command._resolve_latest_version.assert_not_called()
+
+    def test_resolver_forwards_architecture_to_shared_helper(self):
+        with mock.patch(
+                "azext_provisionedmachine.provisioned_machine_utils.resolve_latest_os_image_version",
+                return_value="50.2610.0.20") as resolve_version:
+            result = Create._resolve_latest_version(self.command, "azurelinux", "eastus", "amd64")
+
+        resolve_version.assert_called_once_with(
+            self.command.ctx.cli_ctx, self.command.ctx.subscription_id, "azurelinux", "eastus", "amd64")
+        self.assertEqual(result, "50.2610.0.20")
+
+    def test_no_os_request_does_not_resolve_an_image(self):
+        self.command.ctx.args.os_image_type = None
+
+        list(Create._execute_operations(self.command))
+
+        self.command._resolve_latest_version.assert_not_called()
+        self.assertEqual(self.events, ["voucher", "create"])
+        self.assertIsNone(Create._resolved_version)
+
+    def test_hci_auto_selection_does_not_filter_by_voucher_architecture(self):
+        self.command.ctx.args.os_image_type = self._arg("HCI")
+
+        list(Create._execute_operations(self.command))
+
+        self.command._resolve_latest_version.assert_called_once_with("hci", "eastus", None)
+
+    def test_invalid_voucher_stops_before_image_lookup_and_create(self):
+        self.validation_response = {"ownershipVoucherValidationDetails": [{
+            "validationStatus": "Invalid",
+            "error": {"message": "Voucher is already in use", "details": [
+                {"code": "InvalidOwnershipVoucher", "message": "Choose another voucher"}
+            ]},
+        }]}
+
+        with self.assertRaisesRegex(azclierror_mod.InvalidArgumentValueError, "Choose another voucher"):
+            list(Create._execute_operations(self.command))
+
+        self.command._resolve_latest_version.assert_not_called()
+        self.command.EdgeMachinesCreateOrUpdate.assert_not_called()
+
+    def test_existing_validation_behavior_is_preserved(self):
+        for response in (None, {}, {"ownershipVoucherValidationDetails": []},
+                         {"ownershipVoucherValidationDetails": [{"validationStatus": "Unknown"}]},
+                         {"ownershipVoucherValidationDetails": [{"validationStatus": "Valid"}] * 2}):
+            with self.subTest(response=response):
+                Create._validation_result = response
+
+                self.assertIsNone(Create._validate_voucher_response(self.command))
+
+    def test_auto_selection_without_voucher_architecture_stops_before_image_lookup(self):
+        for response in (None, {}, {"ownershipVoucherValidationDetails": []},
+                         {"ownershipVoucherValidationDetails": [{"validationStatus": "Unknown"}]}):
+            with self.subTest(response=response):
+                self.validation_response = response
+
+                with self.assertRaisesRegex(azclierror_mod.InvalidArgumentValueError, "device architecture"):
+                    list(Create._execute_operations(self.command))
+
+                self.command._resolve_latest_version.assert_not_called()
+                self.command.EdgeMachinesCreateOrUpdate.assert_not_called()
+
+    def test_missing_or_unsupported_architecture_does_not_default_to_amd64(self):
+        for architecture in (None, "", "riscv64"):
+            with self.subTest(architecture=architecture):
+                self.validation_response["ownershipVoucherValidationDetails"][0]["architecture"] = architecture
+
+                with self.assertRaisesRegex(azclierror_mod.InvalidArgumentValueError, "device architecture"):
+                    list(Create._execute_operations(self.command))
+
+                self.command._resolve_latest_version.assert_not_called()
+                self.command.EdgeMachinesCreateOrUpdate.assert_not_called()
+
+    def test_image_lookup_failure_does_not_create_machine(self):
+        self.command._resolve_latest_version.side_effect = azclierror_mod.ResourceNotFoundError("No compatible image")
+
+        with self.assertRaisesRegex(azclierror_mod.ResourceNotFoundError, "No compatible image"):
+            list(Create._execute_operations(self.command))
+
+        self.command.EdgeMachinesCreateOrUpdate.assert_not_called()
+
+
+class TestAzureLinuxPayloadMapping(unittest.TestCase):
+    """Regression guard for bug 38916585: the AzureLinux branch must map the
+    resolved version to ``vsrVersion`` (not ``osVersion``) and must NOT hardcode
+    an ``osImageLocation`` URL, otherwise the RP downloads a stale image."""
+
+    @staticmethod
+    def _read_source(module_filename):
+        pkg_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        path = os.path.join(pkg_root, "aaz", "latest", "provisionedmachine", module_filename)
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def test_create_does_not_hardcode_stale_image_url(self):
+        source = self._read_source("_create.py")
+        self.assertNotIn("aep/sff/azurelinux/2604a", source)
+
+    def test_install_os_does_not_hardcode_stale_image_url(self):
+        source = self._read_source("_install_os.py")
+        self.assertNotIn("aep/sff/azurelinux/2604a", source)
+
+    def test_create_maps_resolved_version_to_vsr_version(self):
+        source = self._read_source("_create.py")
+        self.assertIn('"vsrVersion"', source)
+
+    def test_install_os_maps_resolved_version_to_vsr_version(self):
+        source = self._read_source("_install_os.py")
+        self.assertIn('"vsrVersion"', source)
+
+
+class TestOsImageListArchitectureFilter(unittest.TestCase):
+    """The os-image list command must expose --architecture and forward it as a query parameter."""
+
+    @staticmethod
+    def _read_source():
+        pkg_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        path = os.path.join(pkg_root, "aaz", "latest", "provisionedmachine", "os_image", "_list.py")
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def test_architecture_argument_is_declared(self):
+        source = self._read_source()
+        self.assertIn('_args_schema.architecture', source)
+        self.assertIn('"--architecture"', source)
+
+    def test_architecture_allows_amd64_and_arm64(self):
+        source = self._read_source()
+        self.assertIn('"amd64"', source)
+        self.assertIn('"arm64"', source)
+
+    def test_architecture_is_sent_as_query_parameter(self):
+        source = self._read_source()
+        self.assertIn('parameters["architecture"]', source)
+
+    def test_architecture_is_optional(self):
+        """The filter must not be required, so existing invocations keep working."""
+        source = self._read_source()
+        arch_block = source.split("_args_schema.architecture", 1)[1].split(")", 1)[0]
+        self.assertNotIn("required=True", arch_block)
 
 
 if __name__ == "__main__":

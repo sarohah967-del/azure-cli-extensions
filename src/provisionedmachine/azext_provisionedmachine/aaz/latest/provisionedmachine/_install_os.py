@@ -17,7 +17,8 @@ class InstallOs(AAZCommand):
     """Install Operating System on a specific Provisioned Machine resource.
 
     When --os-image-version is not specified, the latest available version is automatically
-    resolved for both AzureLinux and HCI image types.
+    resolved for both AzureLinux and HCI image types. AzureLinux selection uses the
+    machine's reported hardware architecture, defaulting to amd64 when absent.
 
     :example: Install AzureLinux Operating System (auto-selects latest version)
         az provisionedmachine install-os -g myResourceGroup -n myProvisionedMachine --os-image-type AzureLinux --ssh-public-key "ssh-rsa AAAAB3..."
@@ -79,7 +80,7 @@ class InstallOs(AAZCommand):
         _args_schema.os_image_version = AAZStrArg(
             options=["--os-image-version"],
             arg_group="OS Configuration",
-            help="Version of the OS image. If not specified, the latest available version is automatically selected. ⚡ CHANGED: Renamed from --version -v",
+            help="Version of the OS image. If not specified, the latest available version is automatically selected, matching the hardware architecture for AzureLinux (amd64 when absent). ⚡ CHANGED: Renamed from --version -v",
         )
 
         # Define Arg Group "Authentication"
@@ -182,7 +183,13 @@ class InstallOs(AAZCommand):
         # Auto-resolve latest version if not provided
         if not has_value(args.os_image_version) or not args.os_image_version.to_serialized_data():
             location = machine_data.get("location", "")
-            resolved_version = self._resolve_latest_version(os_image_type, location)
+            architecture = None
+            if os_image_type == "AzureLinux":
+                properties = machine_data.get("properties") or {}
+                reported_properties = properties.get("reportedProperties") or {}
+                hardware_profile = reported_properties.get("hardwareProfile") or {}
+                architecture = hardware_profile.get("architecture") or "amd64"
+            resolved_version = self._resolve_latest_version(os_image_type, location, architecture)
             args.os_image_version = resolved_version
 
         # Validate IP address format
@@ -244,7 +251,7 @@ class InstallOs(AAZCommand):
                 f"/subscriptions/{self.ctx.subscription_id}"
                 f"/resourceGroups/{args.resource_group.to_serialized_data()}"
                 f"/providers/Microsoft.AzureStackHCI/edgeMachines/{args.edge_machine_name.to_serialized_data()}"
-                f"?api-version=2026-05-01-preview"
+                f"?api-version=2026-10-15-preview"
             )
 
             response = send_raw_request(self.ctx.cli_ctx, "GET", url)
@@ -272,62 +279,11 @@ class InstallOs(AAZCommand):
                 f"Error validating machine state: {str(e)}"
             )
 
-    def _resolve_latest_version(self, os_image_type, location):
-        """Resolve the latest available OS image version by calling the os-image list API.
-
-        The API returns images sorted in descending order by version
-        (guaranteed by RP's GetNLatestRecipesAsync which uses
-        OrderByDescending(Version.Parse(FullSolutionVersion))).
-        So the first image is always the latest.
-        """
-        from azure.cli.core.util import send_raw_request
-        from azure.cli.core.azclierror import ResourceNotFoundError
-        import logging
-
-        logger = logging.getLogger(__name__)
-
-        if not location:
-            raise ResourceNotFoundError(
-                "Could not determine location of provisioned machine. "
-                "Please specify --os-image-version explicitly."
-            )
-
-        try:
-            # Call os-image list API to get available versions
-            os_images_url = (
-                f"/subscriptions/{self.ctx.subscription_id}"
-                f"/providers/Microsoft.AzureStackHCI/locations/{location}/osImages"
-                f"?api-version=2026-05-01-preview&solution-type={os_image_type}"
-            )
-            response = send_raw_request(self.ctx.cli_ctx, "GET", os_images_url)
-            data = response.json()
-            images = data.get("value", [])
-
-            if not images:
-                raise ResourceNotFoundError(
-                    f"No OS images found for type '{os_image_type}' in location '{location}'. "
-                    f"Please specify --os-image-version explicitly."
-                )
-
-            # API returns images sorted descending by version — first item is the latest
-            latest_version = images[0].get("properties", {}).get("validatedSolutionRecipeVersion", "")
-
-            if not latest_version:
-                raise ResourceNotFoundError(
-                    f"Could not determine latest version for '{os_image_type}'. "
-                    f"Please specify --os-image-version explicitly."
-                )
-
-            logger.info("Auto-resolved latest %s version: %s", os_image_type, latest_version)
-            return latest_version
-
-        except ResourceNotFoundError:
-            raise
-        except Exception as e:
-            raise ResourceNotFoundError(
-                f"Error resolving latest OS image version: {str(e)}. "
-                f"Please specify --os-image-version explicitly."
-            )
+    def _resolve_latest_version(self, os_image_type, location, architecture=None):
+        """Resolve the latest available OS image (VSR) version via the shared helper."""
+        from azext_provisionedmachine import provisioned_machine_utils as pm
+        return pm.resolve_latest_os_image_version(
+            self.ctx.cli_ctx, self.ctx.subscription_id, os_image_type, location, architecture)
 
     @staticmethod
     def _compare_versions(v1, v2):
@@ -698,14 +654,12 @@ class InstallOs(AAZCommand):
                 }
 
             elif os_image_type == "AzureLinux":
-                os_version = args.os_image_version.to_serialized_data() if has_value(args.os_image_version) else "3.0"
-
                 os_profile = {
                     "osName": "AzureLinux",
-                    "osType": "AzureLinux",
-                    "osVersion": os_version,
-                    "osImageLocation": "https://aka.ms/aep/sff/azurelinux/2604a"
+                    "osType": "AzureLinux"
                 }
+                if has_value(args.os_image_version):
+                    os_profile["vsrVersion"] = args.os_image_version.to_serialized_data()
 
                 user_details = [
                     {

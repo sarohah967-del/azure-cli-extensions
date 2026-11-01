@@ -1,6 +1,6 @@
 # Provisioned Machine
 
-> **Preview** — This extension is currently in public preview (`1.0.0b5`).
+> **Preview** — This extension is currently in public preview (`1.0.0b8`).
 
 Manage Azure Stack HCI Edge Machines using the Azure CLI.
 
@@ -33,6 +33,12 @@ az extension update --name provisionedmachine
 ## Examples
 
 ### Create a provisioned machine
+
+For AzureLinux, omitting `--os-image-version` selects the latest available image
+matching the architecture returned by ownership voucher validation. If no matching
+image is available, creation stops rather than selecting an incompatible image.
+Use `--os-image-version <VsrVersion>` to pin a specific recipe; the service still
+validates that recipe against the device architecture.
 
 ```bash
 # AzureLinux
@@ -84,12 +90,21 @@ az provisionedmachine show-status -n myProvisionedMachine -g myResourceGroup -o 
 
 ### List available OS images
 
+The `-o table` output includes an `Architecture` column (`amd64` or `arm64`) so you can pick the image that matches your hardware.
+
 ```bash
 az provisionedmachine os-image list --os-image-type HCI
 az provisionedmachine os-image list --location australiaeast --os-image-type AzureLinux -o table
+
+# Filter by CPU architecture (AzureLinux only)
+az provisionedmachine os-image list --os-image-type AzureLinux --architecture arm64
 ```
 
 ### Install OS on a provisioned machine
+
+When `--os-image-version` is omitted for AzureLinux, the latest image matching
+`reportedProperties.hardwareProfile.architecture` is selected. Missing architecture
+defaults to `amd64`. An explicit version is passed unchanged to the service.
 
 ```bash
 # AzureLinux (auto-selects latest version when --os-image-version is not specified)
@@ -103,6 +118,9 @@ az provisionedmachine install-os -g myResourceGroup -n myProvisionedMachine --os
 ```
 
 ### Reset OS on a provisioned machine
+
+Reset requests leave the maintenance/ROE image URL unset so the resource provider
+selects its configured image for the device architecture.
 
 ```bash
 az provisionedmachine reset-os -n myProvisionedMachine -g myResourceGroup
