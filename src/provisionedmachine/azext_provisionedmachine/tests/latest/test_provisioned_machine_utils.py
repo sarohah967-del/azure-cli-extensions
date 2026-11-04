@@ -1299,6 +1299,14 @@ class TestRequestHciRpAuthorization(unittest.TestCase):
         self.assertIn("/issueSshCertificateForContributor?", mock_post.call_args[0][0])
 
     @mock.patch('azext_provisionedmachine.provisioned_machine_utils.requests.post')
+    def test_camel_cased_jws_property_from_rp_is_accepted(self, mock_post):
+        body = self._ok_body()
+        body["userSshJsonWebSignature"] = body.pop("userSSHJSONWebSignature")
+        mock_post.return_value = _rp_response(body=body)
+
+        self.assertEqual(self._call()["jws"], [_TEST_JWS])
+
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.requests.post')
     def test_reader_role_is_rejected_without_calling_rp(self, mock_post):
         with self.assertRaises(azclierror.ForbiddenError):
             self._call(role="provisionedmachinereader")

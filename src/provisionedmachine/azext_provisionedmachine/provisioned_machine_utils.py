@@ -771,7 +771,10 @@ def _parse_rp_authorization(resp, expected_username, expected_role):
             "HCI RP returned an invalid SSH authorization response."
         ) from ex
 
-    jws = data.get("userSSHJSONWebSignature") if isinstance(data, dict) else None
+    # HCI RP serializes this property as "userSshJsonWebSignature" while the model
+    # declares "userSSHJSONWebSignature", so match the name case-insensitively.
+    jws = next((v for k, v in data.items() if k.lower() == "usersshjsonwebsignature"),
+               None) if isinstance(data, dict) else None
     if (not isinstance(jws, list) or not jws or
             not all(isinstance(j, str) and _COMPACT_JWS_PATTERN.match(j) for j in jws)):
         raise azclierror.AzureResponseError(
