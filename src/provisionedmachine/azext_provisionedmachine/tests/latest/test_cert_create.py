@@ -90,6 +90,7 @@ class TestSshCertCreateHappyPath(unittest.TestCase):
 
     @mock.patch('azext_provisionedmachine.provisioned_machine_utils.extract_device_id')
     @mock.patch('azext_provisionedmachine.provisioned_machine_utils.sign_certificate_metadata')
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.request_hci_rp_authorization')
     @mock.patch('azext_provisionedmachine.provisioned_machine_utils.generate_ephemeral_keypair')
     @mock.patch('azext_provisionedmachine.provisioned_machine_utils.resolve_user_role')
     @mock.patch('azext_provisionedmachine.provisioned_machine_utils.check_pim_eligibility')
@@ -97,7 +98,7 @@ class TestSshCertCreateHappyPath(unittest.TestCase):
     @mock.patch('azext_provisionedmachine.provisioned_machine_utils.validate_vault_name')
     @mock.patch('azext_provisionedmachine.provisioned_machine_utils.validate_resource_id')
     def test_happy_path(self, mock_rid, mock_vn, mock_user, mock_pim, mock_role,
-                        mock_keygen, mock_sign, mock_device_id):
+                        mock_keygen, mock_rp, mock_sign, mock_device_id):
         self._setup_mocks()
         cmd = _make_cmd()
 
@@ -107,6 +108,11 @@ class TestSshCertCreateHappyPath(unittest.TestCase):
                                  "2026-05-26T10:00:00Z", "2026-05-26T14:00:00Z")
         mock_role.return_value = "Provisioned Machine Contributor"
         mock_keygen.return_value = (self.priv_path, self.pub_path)
+        mock_rp.return_value = {
+            "username": "user", "role": "provisionedmachinecontributor",
+            "validFrom": "2026-05-26T10:00:05Z", "validTo": "2026-05-26T13:55:00Z",
+            "jws": ["a.b.c"],
+        }
         mock_sign.return_value = {"certificatePath": self.cert_path}
 
         result = _call_ssh_cert_create(cmd, _VALID_VAULT, _VALID_RESOURCE_ID)
@@ -114,20 +120,24 @@ class TestSshCertCreateHappyPath(unittest.TestCase):
         self.assertIn("privateKeyPath", result)
         self.assertIn("certificatePath", result)
 
+        mock_rp.assert_called_once_with(cmd, _VALID_RESOURCE_ID, "provisionedmachinecontributor",
+                                        "user", self.pub_path, "2026-05-26T14:00:00Z")
         metadata = mock_sign.call_args[0][2]
         self.assertEqual(metadata["username"], "user")
         self.assertEqual(metadata["role"], "provisionedmachinecontributor")
         self.assertEqual(metadata["deviceId"], "myDevice")
-        self.assertEqual(metadata["startTime"], "2026-05-26T10:00:00Z")
-        self.assertEqual(metadata["endTime"], "2026-05-26T14:00:00Z")
+        self.assertEqual(metadata["startTime"], "2026-05-26T10:00:05Z")
+        self.assertEqual(metadata["endTime"], "2026-05-26T13:55:00Z")
+        self.assertEqual(metadata["hciRpAuthorization"], ["a.b.c"])
 
 
 class TestSshCertCreateCleanupOnFailure(unittest.TestCase):
-    """Verify ephemeral files are cleaned up when signing fails."""
+    """Verify ephemeral files are cleaned up when authorization or signing fails."""
 
     @mock.patch('azext_provisionedmachine.provisioned_machine_utils.extract_device_id')
     @mock.patch('azext_provisionedmachine.provisioned_machine_utils.cleanup_ephemeral_files')
     @mock.patch('azext_provisionedmachine.provisioned_machine_utils.sign_certificate_metadata')
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.request_hci_rp_authorization')
     @mock.patch('azext_provisionedmachine.provisioned_machine_utils.generate_ephemeral_keypair')
     @mock.patch('azext_provisionedmachine.provisioned_machine_utils.resolve_user_role')
     @mock.patch('azext_provisionedmachine.provisioned_machine_utils.check_pim_eligibility')
@@ -135,7 +145,7 @@ class TestSshCertCreateCleanupOnFailure(unittest.TestCase):
     @mock.patch('azext_provisionedmachine.provisioned_machine_utils.validate_vault_name')
     @mock.patch('azext_provisionedmachine.provisioned_machine_utils.validate_resource_id')
     def test_cleanup_on_sign_failure(self, mock_rid, mock_vn, mock_user, mock_pim, mock_role,
-                                     mock_keygen, mock_sign, mock_cleanup, mock_device_id):
+                                     mock_keygen, mock_rp, mock_sign, mock_cleanup, mock_device_id):
         cmd = _make_cmd()
         mock_device_id.return_value = "myDevice"
 
@@ -151,6 +161,11 @@ class TestSshCertCreateCleanupOnFailure(unittest.TestCase):
                                  "2026-05-26T10:00:00Z", "2026-05-26T14:00:00Z")
         mock_role.return_value = "Provisioned Machine Admin"
         mock_keygen.return_value = (priv, pub)
+        mock_rp.return_value = {
+            "username": "user", "role": "provisionedmachineadmin",
+            "validFrom": "2026-05-26T10:00:00Z", "validTo": "2026-05-26T14:00:00Z",
+            "jws": ["a.b.c"],
+        }
         mock_sign.side_effect = azclierror.CLIInternalError("KV failed")
 
         with self.assertRaises(azclierror.CLIInternalError):
@@ -160,6 +175,32 @@ class TestSshCertCreateCleanupOnFailure(unittest.TestCase):
 
         import shutil
         shutil.rmtree(keys_dir, ignore_errors=True)
+
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.extract_device_id')
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.cleanup_ephemeral_files')
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.sign_certificate_metadata')
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.request_hci_rp_authorization')
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.generate_ephemeral_keypair')
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.resolve_user_role')
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.check_pim_eligibility')
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.get_current_user_principal')
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.validate_vault_name')
+    @mock.patch('azext_provisionedmachine.provisioned_machine_utils.validate_resource_id')
+    def test_rp_failure_skips_signing_and_cleans_up(self, mock_rid, mock_vn, mock_user, mock_pim,
+                                                    mock_role, mock_keygen, mock_rp, mock_sign,
+                                                    mock_cleanup, mock_device_id):
+        cmd = _make_cmd()
+        mock_user.return_value = "user"
+        mock_pim.return_value = ([{}], "2026-05-26T10:00:00Z", "2026-05-26T14:00:00Z")
+        mock_role.return_value = "Provisioned Machine Admin"
+        mock_keygen.return_value = ("priv", "priv.pub")
+        mock_rp.side_effect = azclierror.AzureResponseError("disabled (HTTP 501)")
+
+        with self.assertRaises(azclierror.AzureResponseError):
+            _call_ssh_cert_create(cmd, _VALID_VAULT, _VALID_RESOURCE_ID)
+
+        mock_sign.assert_not_called()
+        mock_cleanup.assert_called_once_with("priv", None)
 
 
 class TestSshCertCreateRoleDerivation(unittest.TestCase):

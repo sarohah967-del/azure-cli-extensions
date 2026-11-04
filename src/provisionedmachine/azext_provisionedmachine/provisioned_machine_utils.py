@@ -9,13 +9,20 @@ Utilities for the `az ssh cert-create` command.
 Step 1 – Prepare certificate metadata:
     user_public_key + username + role (from PIM assignment) + validity window
 
-Step 2 – Sign via Key Vault Sign API:
-    Build the OpenSSH certificate body in memory (ssh-rsa-cert-v01@openssh.com).
+Step 2 – Authorize via HCI RP:
+    Call the EdgeMachine ``issueSshCertificateForAdmin`` / ``issueSshCertificateForContributor``
+    action matching the caller's role. HCI RP validates the request and returns
+    JSON Web Signatures (signed with the HCI RP SSH CA key) plus the authorized
+    username, role and validity window.
+
+Step 3 – Countersign via Key Vault Sign API:
+    Build the OpenSSH certificate body in memory (ssh-rsa-cert-v01@openssh.com),
+    embedding the HCI RP JWS in the ``hci-rp-jws@microsoft.com`` extension.
     Hash it with SHA-512 and send the digest to Key Vault's Sign API (RS512).
     The CA private key is non-exportable and never leaves Key Vault.
     Assemble the final certificate with the returned signature.
 
-Step 3 – Return to user:
+Step 4 – Return to user:
     Signed SSH user certificate + freshly generated user_private key.
     Output is identical to `ssh-keygen -s` and validated by standard sshd.
 
@@ -26,6 +33,7 @@ import base64
 import datetime
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -56,6 +64,19 @@ _SSH_CERT_USER = 1       # user certificate (vs host=2)
 _SSH_SIG_ALGO = "rsa-sha2-512"
 _RSA_KEY_BITS = 4096
 _PRIVATE_KEY_FILE_PERMISSION = 0o600   # owner read/write only
+
+# HCI RP SSH authorization (JWS issuance) constants
+_RP_API_VERSION = "2026-03-15-preview"
+_RP_TIMEOUT_SECONDS = 60
+_RP_MAX_VALIDITY_HOURS = 8
+# Margin kept below the RP's "now + 8h" cap to tolerate client/server clock skew.
+_RP_CLOCK_SKEW_SECONDS = 300
+_RP_ISSUE_ACTIONS = {
+    "provisionedmachineadmin": "issueSshCertificateForAdmin",
+    "provisionedmachinecontributor": "issueSshCertificateForContributor",
+}
+_RP_JWS_EXTENSION = "hci-rp-jws@microsoft.com"
+_COMPACT_JWS_PATTERN = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
 _RESOURCE_ID_PATTERN = re.compile(
     r"^/subscriptions/[0-9a-fA-F-]+/resourceGroups/[^/]+/providers/[^/]+/[^/]+/[^/]+$",
     re.IGNORECASE,
@@ -522,9 +543,13 @@ def cleanup_ephemeral_files(*file_paths):
 def sign_certificate_metadata(cmd, keyvault_name, metadata):
     """Sign the user's public key via Key Vault Sign API (RS512).
 
-    Metadata shape:  { username, role, deviceId, startTime, endTime, publicKeyPath }
+    Metadata shape:  { username, role, deviceId, startTime, endTime, publicKeyPath,
+    hciRpAuthorization (optional list of compact JWS strings) }
 
-    The Key Vault key name is derived as ``{deviceId}-ssh-ca``.
+    The Key Vault key name is derived as ``{deviceId}-ssh-ca``. When
+    ``hciRpAuthorization`` is present, the HCI RP JWS strings are embedded
+    (comma-separated) in the ``hci-rp-jws@microsoft.com`` certificate extension,
+    so the Key Vault signature countersigns the HCI RP authorization.
 
     Returns a dict with ``certificatePath``.
     """
@@ -534,6 +559,7 @@ def sign_certificate_metadata(cmd, keyvault_name, metadata):
     start_time = metadata["startTime"]
     end_time = metadata["endTime"]
     public_key_path = metadata["publicKeyPath"]
+    hci_rp_jws = metadata.get("hciRpAuthorization") or []
 
     # Key name is per-device: {deviceId}-ssh-ca
     kv_key_name = f"{device_id}{_KV_CA_KEY_SUFFIX}"
@@ -565,6 +591,10 @@ def sign_certificate_metadata(cmd, keyvault_name, metadata):
 
     key_id = username
 
+    extensions = {"permit-pty": b""}
+    if hci_rp_jws:
+        extensions[_RP_JWS_EXTENSION] = _ssh_string(",".join(hci_rp_jws).encode("ascii"))
+
     # Build the certificate body (everything that gets signed).
     cert_body = _build_cert_body(
         user_e=user_e,
@@ -575,6 +605,7 @@ def sign_certificate_metadata(cmd, keyvault_name, metadata):
         valid_after=valid_after,
         valid_before=valid_before,
         ca_pub_blob=ca_pub_blob,
+        extensions=extensions,
     )
 
     # Hash the body with SHA-512 and send to KV Sign API.
@@ -604,6 +635,187 @@ def extract_device_id(resource_id):
     E.g. ``/subscriptions/.../providers/X/Y/myDevice`` → ``myDevice``
     """
     return resource_id.rstrip("/").rsplit("/", 1)[-1]
+
+
+def compute_rp_validity_window(end_time, now=None):
+    """Clamp the PIM access window to what HCI RP accepts for SSH issuance.
+
+    HCI RP requires ``validTo`` to be after now, no later than now + 8h and no
+    more than 8h after ``validFrom``. A small skew margin is subtracted from the
+    cap so client clocks running ahead of the RP are not rejected.
+
+    Returns ``(valid_from_iso, valid_to_iso, duration_in_hours)``.
+    """
+    now = (now or datetime.datetime.now(datetime.timezone.utc)).replace(microsecond=0)
+    pim_end = _parse_rp_datetime(end_time)
+    cap = now + datetime.timedelta(hours=_RP_MAX_VALIDITY_HOURS, seconds=-_RP_CLOCK_SKEW_SECONDS)
+    valid_to = min(pim_end, cap)
+    if valid_to <= now:
+        raise azclierror.AuthenticationError(
+            "Your PIM activation expires too soon to issue an SSH certificate. "
+            "Please re-activate your PIM-eligible role and retry."
+        )
+    hours = (valid_to - now).total_seconds() / 3600.0
+    duration = max(1, min(_RP_MAX_VALIDITY_HOURS, math.ceil(hours)))
+    return (now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            valid_to.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            duration)
+
+
+def request_hci_rp_authorization(cmd, resource_id, role, username, public_key_path, end_time):
+    """Request a role-specific SSH authorization (JWS) from HCI RP.
+
+    Calls ``POST {resourceId}/issueSshCertificateForAdmin`` or
+    ``.../issueSshCertificateForContributor`` based on the caller's normalized
+    role. HCI RP selects the role server-side and signs the authorization with
+    the HCI RP SSH CA key.
+
+    Returns a dict ``{username, role, validFrom, validTo, jws}`` where the times
+    are ISO-8601 UTC strings and ``jws`` is a list of compact JWS strings.
+    """
+    action = _RP_ISSUE_ACTIONS.get(role)
+    if not action:
+        raise azclierror.ForbiddenError(
+            f"Role '{role}' is not permitted to SSH into the device. "
+            f"Activate the Provisioned Machine Admin or Contributor role and retry."
+        )
+
+    with open(public_key_path, "r", encoding="utf-8") as f:
+        user_public_key = f.read().strip()
+
+    valid_from, valid_to, duration = compute_rp_validity_window(end_time)
+    body = {
+        "username": username,
+        "userPublicKey": user_public_key,
+        "durationInHours": duration,
+        "validFrom": valid_from,
+        "validTo": valid_to,
+    }
+
+    from azure.cli.core._profile import Profile
+    profile = Profile(cli_ctx=cmd.cli_ctx)
+    try:
+        creds, _, _ = profile.get_login_credentials()
+        token = creds.get_token("https://management.azure.com/.default")
+    except Exception as ex:
+        raise azclierror.AuthenticationError(
+            "Failed to acquire a management token for HCI RP SSH authorization."
+        ) from ex
+
+    url = (f"https://management.azure.com{resource_id.rstrip('/')}/{action}"
+           f"?api-version={_RP_API_VERSION}")
+    logger.info("Requesting SSH authorization from HCI RP: %s", action)
+
+    try:
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {token.token}",
+                     "Content-Type": "application/json"},
+            json=body,
+            timeout=_RP_TIMEOUT_SECONDS,
+        )
+    except requests.exceptions.Timeout as ex:
+        raise azclierror.AzureConnectionError(
+            f"HCI RP SSH authorization request timed out after {_RP_TIMEOUT_SECONDS}s."
+        ) from ex
+    except requests.exceptions.RequestException as ex:
+        raise azclierror.AzureConnectionError(
+            f"Failed to reach HCI RP for SSH authorization: {ex}"
+        ) from ex
+
+    _raise_for_rp_error(resp, resource_id, action)
+    return _parse_rp_authorization(resp, username, role)
+
+
+def _raise_for_rp_error(resp, resource_id, action):
+    """Map HCI RP SSH authorization failures to CLI errors."""
+    status = resp.status_code
+    if status == 200:
+        return
+    try:
+        detail = resp.json().get("error", {}).get("message") or resp.text
+    except ValueError:
+        detail = resp.text
+    if status == 400:
+        raise azclierror.InvalidArgumentValueError(
+            f"HCI RP rejected the SSH authorization request: {detail}"
+        )
+    if status == 401:
+        raise azclierror.UnauthorizedError(
+            "HCI RP could not authenticate the request. Please run 'az login' and retry."
+        )
+    if status == 403:
+        raise azclierror.ForbiddenError(
+            f"The signed-in identity is not authorized to perform '{action}' on "
+            f"'{resource_id}'. Ensure your PIM-eligible role is active and retry."
+        )
+    if status == 404:
+        raise azclierror.ResourceNotFoundError(
+            f"Resource '{resource_id}' was not found or does not support SSH authorization."
+        )
+    if status == 501:
+        raise azclierror.AzureResponseError(
+            "SSH certificate issuance is not enabled by HCI RP in this environment (HTTP 501)."
+        )
+    raise azclierror.AzureResponseError(
+        f"HCI RP SSH authorization failed (HTTP {status}): {detail}"
+    )
+
+
+def _parse_rp_authorization(resp, expected_username, expected_role):
+    """Validate the HCI RP SSH authorization response body."""
+    try:
+        data = resp.json()
+    except ValueError as ex:
+        raise azclierror.AzureResponseError(
+            "HCI RP returned an invalid SSH authorization response."
+        ) from ex
+
+    # HCI RP serializes this property as "userSshJsonWebSignature" while the model
+    # declares "userSSHJSONWebSignature", so match the name case-insensitively.
+    jws = next((v for k, v in data.items() if k.lower() == "usersshjsonwebsignature"),
+               None) if isinstance(data, dict) else None
+    if (not isinstance(jws, list) or not jws or
+            not all(isinstance(j, str) and _COMPACT_JWS_PATTERN.match(j) for j in jws)):
+        raise azclierror.AzureResponseError(
+            "HCI RP response does not contain valid 'userSSHJSONWebSignature' values."
+        )
+    if data.get("username") != expected_username or data.get("role") != expected_role:
+        raise azclierror.AzureResponseError(
+            f"HCI RP authorized username '{data.get('username')}' with role "
+            f"'{data.get('role')}', but '{expected_username}' with role "
+            f"'{expected_role}' was requested."
+        )
+    try:
+        valid_from = _parse_rp_datetime(data["validFrom"])
+        valid_to = _parse_rp_datetime(data["validTo"])
+    except (KeyError, TypeError, ValueError) as ex:
+        raise azclierror.AzureResponseError(
+            "HCI RP response has an invalid 'validFrom' or 'validTo' value."
+        ) from ex
+    if valid_to <= valid_from:
+        raise azclierror.AzureResponseError(
+            "HCI RP response has 'validTo' not later than 'validFrom'."
+        )
+
+    return {
+        "username": data["username"],
+        "role": data["role"],
+        "validFrom": valid_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "validTo": valid_to.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "jws": jws,
+    }
+
+
+def _parse_rp_datetime(value):
+    """Parse an ISO-8601 timestamp (including .NET 7-digit fractions) as aware UTC."""
+    text = value.strip().replace("Z", "+00:00")
+    # Python < 3.11 accepts at most 6 fractional digits.
+    text = re.sub(r"(\.\d{6})\d+", r"\1", text)
+    parsed = datetime.datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -779,8 +991,14 @@ def _kv_sign_digest(cmd, keyvault_name, key_name, digest_bytes):
 # ---------------------------------------------------------------------------
 
 def _build_cert_body(user_e, user_n, serial, key_id, principals,
-                     valid_after, valid_before, ca_pub_blob):
-    """Build the to-be-signed body of an ssh-rsa-cert-v01@openssh.com certificate."""
+                     valid_after, valid_before, ca_pub_blob, extensions=None):
+    """Build the to-be-signed body of an ssh-rsa-cert-v01@openssh.com certificate.
+
+    ``extensions`` maps extension name to its already-encoded data bytes
+    (``b""`` for flag extensions). Defaults to ``permit-pty`` only.
+    """
+    if extensions is None:
+        extensions = {"permit-pty": b""}
     buf = bytearray()
 
     # cert type
@@ -816,11 +1034,12 @@ def _build_cert_body(user_e, user_n, serial, key_id, principals,
     # critical options: empty (no restrictions beyond extensions)
     buf += _ssh_string(b"")
 
-    # extensions: permit-pty only (agent/port/X11 forwarding disabled by omission)
+    # extensions: permit-pty (agent/port/X11 forwarding disabled by omission)
+    # plus any non-critical extensions such as the HCI RP JWS; sorted by name.
     ext_buf = bytearray()
-    for ext_name in sorted(["permit-pty"]):
+    for ext_name in sorted(extensions):
         ext_buf += _ssh_string(ext_name.encode())
-        ext_buf += _ssh_string(b"")
+        ext_buf += _ssh_string(extensions[ext_name])
     buf += _ssh_string(bytes(ext_buf))
 
     # reserved (empty)

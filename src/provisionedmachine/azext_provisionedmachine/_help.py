@@ -19,12 +19,16 @@ helps['provisionedmachine ssh-cert-create'] = """
     type: command
     short-summary: Create a short-lived SSH certificate for authenticating to a provisioned machine.
     long-summary: |
-        Generates an SSH certificate signed by the device's CA key stored in
-        Azure Key Vault. The certificate includes the caller's identity and
-        role, and is valid for the duration of the active access window.
+        Requests a role-specific SSH authorization from HCI RP (a JSON Web
+        Signature signed with the HCI RP SSH CA key), embeds it in an OpenSSH
+        certificate and countersigns that certificate with the device's CA key
+        stored in the customer Azure Key Vault. The certificate includes the
+        caller's identity and role, and is valid for the active access window
+        (at most 8 hours).
 
-        Requires an active eligible role on the target device resource.
-        The caller's identity and role are resolved automatically.
+        Requires an active eligible Provisioned Machine Admin or Contributor role
+        on the target device resource. The caller's identity and role are resolved
+        automatically.
     parameters:
         - name: --vault-name -v
           short-summary: Name of the Azure Key Vault containing the SSH CA signing key.

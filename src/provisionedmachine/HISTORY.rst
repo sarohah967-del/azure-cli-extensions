@@ -2,6 +2,10 @@
 
 Release History
 ===============
+Unreleased
+++++++++++
+* ``az provisionedmachine ssh-cert-create`` - Requests a role-specific SSH authorization (JWS) from HCI RP via ``issueSshCertificateForAdmin`` / ``issueSshCertificateForContributor`` (``2026-03-15-preview``), embeds it in the ``hci-rp-jws@microsoft.com`` certificate extension and countersigns the certificate with the customer Key Vault device CA key. Validity is clamped to the RP's 8-hour limit, and the Reader role is rejected.
+
 1.0.0b8
 +++++++
 * ``az provisionedmachine create`` - Fixed automatic AzureLinux OS image selection to use the architecture returned by ownership voucher validation before choosing the first compatible image. Architecture-aware lookups use ``2026-10-15-preview``; existing unfiltered callers retain ``2026-05-01-preview``. Explicit ``--os-image-version`` selection remains unchanged.

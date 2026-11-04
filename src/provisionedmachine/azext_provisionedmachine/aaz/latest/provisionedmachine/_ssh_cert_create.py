@@ -24,12 +24,15 @@ logger = get_logger(__name__)
 class SshCertCreate(AAZCommand):
     """Create a short-lived SSH certificate for authenticating to a provisioned machine.
 
-    Generates an SSH certificate signed by the device's CA key stored in
-    Azure Key Vault. The certificate includes the caller's identity and
-    role, and is valid for the duration of the active access window.
+    Requests a role-specific SSH authorization from HCI RP (a JSON Web Signature
+    signed with the HCI RP SSH CA key), embeds it in an OpenSSH certificate and
+    countersigns that certificate with the device's CA key stored in the customer
+    Azure Key Vault. The certificate includes the caller's identity and role, and
+    is valid for the active access window (at most 8 hours).
 
-    Requires an active eligible role on the target device resource.
-    The caller's identity and role are resolved automatically.
+    Requires an active eligible Provisioned Machine Admin or Contributor role
+    on the target device resource. The caller's identity and role are resolved
+    automatically.
 
     :example: Create a certificate using default output paths
         az provisionedmachine ssh-cert-create --vault-name myKeyVault --resource-id /subscriptions/.../providers/Microsoft.AzureStackHCI/edgeMachines/myDevice
@@ -142,22 +145,31 @@ class SshCertCreate(AAZCommand):
             # Generate fresh ephemeral SSH key pair.
             tmp_private_key_path, public_key_path = pm.generate_ephemeral_keypair()
 
+            # -- Step 2: Authorize via HCI RP (role-specific JWS) ---------------
+            authorization = pm.request_hci_rp_authorization(
+                cmd, resource_id, cert_role, username, public_key_path, end_time
+            )
+            logger.info("HCI RP authorized '%s' as '%s' (valid %s to %s)",
+                        authorization["username"], authorization["role"],
+                        authorization["validFrom"], authorization["validTo"])
+
             certificate_metadata = {
-                "username": username,
-                "role": cert_role,
+                "username": authorization["username"],
+                "role": authorization["role"],
                 "deviceId": device_id,
-                "startTime": start_time,
-                "endTime": end_time,
+                "startTime": authorization["validFrom"],
+                "endTime": authorization["validTo"],
                 "publicKeyPath": public_key_path,
+                "hciRpAuthorization": authorization["jws"],
             }
 
-            # -- Step 2: Sign -------------------------------------------------
+            # -- Step 3: Countersign with customer Key Vault ------------------
             signed_certificate = pm.sign_certificate_metadata(
                 cmd, vault_name, certificate_metadata
             )
             tmp_cert_path = signed_certificate["certificatePath"]
 
-            # -- Step 3: Move to user-specified paths (if provided) -----------
+            # -- Step 4: Move to user-specified paths (if provided) -----------
             final_private_key = tmp_private_key_path
             final_cert = tmp_cert_path
 
@@ -177,7 +189,7 @@ class SshCertCreate(AAZCommand):
             if private_key_path and cert_path:
                 pm.cleanup_ephemeral_files(tmp_private_key_path, tmp_cert_path)
 
-            # -- Step 4: Return to user ----------------------------------------
+            # -- Step 5: Return to user ----------------------------------------
             result = {
                 "privateKeyPath": final_private_key,
                 "certificatePath": final_cert,
